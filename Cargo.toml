@@ -1,0 +1,17 @@
+[package]
+name = "make-it-rain"
+version = "0.1.0"
+authors = ["Kriston Costa"]
+edition = "2018"
+
+# See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
+
+[dependencies]
+termion = "*"
+shiplift =  { git = "https://github.com/softprops/shiplift.git" }
+tokio = "*"
+tokio-executor = "0.1"
+rusqlite = "0.20.0"
+log = "0.4"
+env_logger = "0.7.1"
+http = "0.1.19"
