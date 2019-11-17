@@ -4,8 +4,11 @@ extern crate rusqlite;
 #[macro_use] extern crate log;
 extern crate env_logger;
 
-use crate::service::{MCServerLogOptions, MCServerCommands};
+use crate::service::{MCServerLogOptions, MCServerCommands, MCServerOptionsBuilder, MCContainerService};
+use std::path::PathBuf;
+use std::str::FromStr;
 
+const DEFAULT_MC_PORT: u32 = 25565;
 
 #[derive(Debug)]
 pub struct MCWorker {
@@ -36,14 +39,16 @@ pub mod repository {
 mod service {
     use crate::repository::MCRepository;
 
-    use shiplift::{Docker, Container, LogsOptions, Error};
-    use shiplift::builder::{ContainerOptions};
+    use shiplift::{Docker, Container, LogsOptions, Error, RmContainerOptions};
+    use shiplift::builder::{ContainerOptions, RmContainerOptionsBuilder};
     use shiplift::rep::{ContainerCreateInfo, ContainerDetails};
 
     use tokio::prelude::{Future, Stream};
     use tokio::runtime::Runtime;
 
     use log::{info, warn};
+    use crate::DEFAULT_MC_PORT;
+    use std::path::{Path, PathBuf};
 
     pub struct MCService {
         repo: MCRepository,
@@ -62,11 +67,12 @@ mod service {
         }
 
         pub fn create(&mut self, options: &MCServerOptions) -> Result<String, ()> {
+            let volume_path = options.volume.as_path().to_str().expect("unable to load path");
             let options = ContainerOptions::builder(self.image.as_ref())
                 .env(vec!["EULA=TRUE"])
-                .volumes(vec![&format!("{}:/data/world", options.volume)])
+                .volumes(vec![&format!("{}:/data", volume_path)])
                 .attach_stdin(true)
-                .expose(options.port, "tcp", 25565)
+                .expose(options.port, "tcp", DEFAULT_MC_PORT)
                 .build();
 
             let runner = self.docker
@@ -84,25 +90,37 @@ mod service {
             Ok(info.id)
         }
 
-        pub fn get(service: &MCService, id: String) -> Result<MCContainer, ()> {
-            info!("entering get");
-            Ok(MCContainer{
-                container: Container::new(&service.docker, id),
-                runtime: Runtime::new().expect("failed to make tokio runtime"),
-
-            })
+        pub fn get_container(id: String) -> MCContainer {
+            MCContainer {
+                id
+            }
         }
+
+
     }
-    pub struct MCContainer<'a, 'b> {
-        container: Container<'a, 'b>,
+    pub struct MCContainer {
+        id: String,
+    }
+
+    pub struct MCContainerService {
+        repo: MCRepository,
+        docker: Docker,
         runtime: Runtime,
     }
+    impl MCContainerService {
+        pub fn new() -> Self {
+            MCContainerService {
+                docker: Docker::host("http://localhost:2375".parse().unwrap()),
+                repo: MCRepository::new(),
+                runtime: Runtime::new().expect("failed to make tokio runtime"),
+            }
+        }
 
-    impl <'a, 'b> MCContainer<'a, 'b> {
-
-        pub fn start(&mut self) -> Result<(), ()> {
-            self.runtime.spawn(
-                self.container.start()
+        pub fn start(&mut self, container: &MCContainer) -> Result<(), ()> {
+            info!("Starting container: {}", container.id);
+            let container = Container::new(&self.docker, container.id.clone());
+            self.runtime.block_on(
+                container.start()
                     .map_err(|e| {
                         match e {
                             Error::Fault {
@@ -115,30 +133,44 @@ mod service {
                             },
                             _ => {error!("{}", e)},
                         }
-                    }));
-            let container_info: ContainerDetails = self.runtime.block_on(self.container.inspect()).expect("");
+                    })).expect("couldn't start container");
+            let container_info: ContainerDetails = self.runtime.block_on(container.inspect()).expect("");
             if !container_info.state.error.is_empty() {
                 error!("Error: {:?}", container_info.state);
                 return Err(());
             }
-            return Ok(())
+            Ok(())
         }
 
-        pub fn run_command(&mut self, command: MCServerCommands) {
+        pub fn stop(&mut self, container: &MCContainer) -> Result<(), ()> {
+            info!("Stopping container: {}", container.id);
+            let container = Container::new(&self.docker, container.id.clone());
+            self.runtime.block_on(
+                container
+                    .stop(None)
+                    .map_err(|e| error!("{}", e))
+            )
+        }
+
+        pub fn run_command(&mut self, container: &MCContainer, command: MCServerCommands) -> Result<(), ()> {
+            info!("Running command {:?} on container {}", command, container.id);
+            let container = Container::new(&self.docker, container.id.clone());
             use std::io::prelude::*;
-            let x = self.container
+            self.runtime.block_on(
+                container
                 .attach()
                 .map(move |mut mul| {
                     mul.write_all(command.to_string().as_bytes());
                     mul.flush();
                 })
-                .map_err(|e| error!("Error: {:?}", e));
-            self.runtime.spawn(x);
-
+                .map_err(|e| error!("Error: {:?}", e))
+            )
         }
 
-        pub fn logs(&mut self, options: &MCServerLogOptions) {
-            let log_runner = self.container.logs(&LogsOptions::builder()
+        pub fn logs(&mut self, container: &MCContainer, options: &MCServerLogOptions) {
+            info!("Logging container: {}", container.id);
+            let container = Container::new(&self.docker, container.id.clone());
+            let log_runner = container.logs(&LogsOptions::builder()
                 .stderr(true)
                 .stdout(true)
                 .tail(&options.limit)
@@ -153,8 +185,22 @@ mod service {
                 info!("{}", log.as_string_lossy());
             }
         }
+        pub fn rm(&mut self, container: &MCContainer) -> Result<(), ()> {
+            info!("Removing container: {}", container.id);
+            let container = Container::new(&self.docker, container.id.clone());
+            let options = RmContainerOptions::builder()
+                .force(true)
+                .build();
+            self.runtime.block_on(
+                container
+                    .remove(options)
+                    .map_err(|e| error!("{}", e))
+            )
+            // Ok(())
+        }
     }
 
+    #[derive(Debug)]
     pub enum MCServerCommands {
         OP(String),
     }
@@ -177,9 +223,8 @@ mod service {
         }
     }
 
-
     pub struct MCServerOptions {
-        volume: String,
+        volume: PathBuf,
         port: u32,
         name: String,
     }
@@ -187,6 +232,31 @@ mod service {
     pub struct MCServerOptionsBuilder {
         name: String,
         port: u32,
+        volume: PathBuf
+    }
+
+    impl MCServerOptionsBuilder {
+
+        pub fn new(name: String, volume: PathBuf) -> Self {
+            MCServerOptionsBuilder {
+                name,
+                volume,
+                port: DEFAULT_MC_PORT,
+            }
+        }
+
+        pub fn port(mut self, port: u32) -> Self {
+            self.port = port;
+            self
+        }
+
+        pub fn build(self) -> MCServerOptions {
+            MCServerOptions {
+                volume: self.volume,
+                port: self.port,
+                name: self.name,
+            }
+        }
     }
 }
 
@@ -194,15 +264,18 @@ fn main() {
     use crate::service::MCService;
     env_logger::init();
     use std::{thread, time};
-
+    let path = PathBuf::from_str("/Users/kristoncosta/Workspace/PalaceRetreat").expect("couldn't make pathbuf");
+    let server_options = MCServerOptionsBuilder::new("test_name".to_string(), path).build();
     let mut serv = MCService::new();
-    let mut container = MCService::get(
-        &serv, "a59d11a008629358463dcd1094488d626863df8831f31b6f73bfb8b60c426e65".to_string())
-        .expect("Couldn't get container");
-    container.start().expect("Failed to start");
-    container.logs(&Default::default());
-    container.run_command(MCServerCommands::OP("Sylent_Buck".to_string()));
-    thread::sleep(time::Duration::from_millis(100));
-    container.logs(&Default::default());
+    let id = serv.create(&server_options).expect("couldn't make container");
+    let mut container = MCService::get_container(id);
 
+    let mut container_service = MCContainerService::new();
+    container_service.start(&container).expect("Failed to start");
+    container_service.logs(&container, &Default::default());
+    container_service.run_command(&container, MCServerCommands::OP("Sylent_Buck".to_string()));
+    thread::sleep(time::Duration::from_millis(5000));
+    container_service.logs(&container, &Default::default());
+    container_service.stop(&container).expect("couldn't stop container");
+    container_service.rm(&container).expect("couldn't rm");
 }
