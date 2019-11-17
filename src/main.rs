@@ -1,12 +1,18 @@
 extern crate termion;
 extern crate shiplift;
 extern crate rusqlite;
-#[macro_use] extern crate log;
+#[macro_use]
+extern crate log;
 extern crate env_logger;
+#[macro_use]
+extern crate rouille;
+extern crate serde;
+#[macro_use] extern crate serde_derive;
+
 
 use crate::service::{MCServerLogOptions, MCServerCommands, MCServerOptionsBuilder, MCContainerService};
-use std::path::PathBuf;
-use std::str::FromStr;
+
+use crate::server::Server;
 
 const DEFAULT_MC_PORT: u32 = 25565;
 
@@ -47,8 +53,32 @@ mod service {
     use tokio::runtime::Runtime;
 
     use log::{info, warn};
-    use crate::DEFAULT_MC_PORT;
+    use crate::{DEFAULT_MC_PORT};
     use std::path::{Path, PathBuf};
+
+    pub enum MCError {
+        FailedToCreateContainer,
+        FailedToStartContainer(String),
+        FailedToInspectContainer(String),
+        FailedToStopContainer(String),
+        FailedToRunCommand(String, MCServerCommands),
+        FailedToRMContainer(String),
+        ContainerError(String, String),
+    }
+
+    impl ToString for MCError {
+        fn to_string(&self) -> String {
+            match self {
+                MCError::FailedToCreateContainer => {format!("failed to create container")},
+                MCError::FailedToStartContainer(x) => {format!("failed to start container {}", x)},
+                MCError::FailedToInspectContainer(x) => {format!("failed to inspect container {}", x)},
+                MCError::FailedToStopContainer(x) => {format!("failed to stop container {}", x)},
+                MCError::FailedToRunCommand(x, c) => {format!("failed to run command {:?} on container {}", c, x)},
+                MCError::FailedToRMContainer(x) => {format!("failed to rm container {}", x)},
+                MCError::ContainerError(_, e) => {format!("{}", e)},
+            }
+        }
+    }
 
     pub struct MCService {
         repo: MCRepository,
@@ -66,7 +96,7 @@ mod service {
             }
         }
 
-        pub fn create(&mut self, options: &MCServerOptions) -> Result<String, ()> {
+        pub fn create(&mut self, options: &MCServerOptions) -> Result<MCContainer, MCError> {
             let volume_path = options.volume.as_path().to_str().expect("unable to load path");
             let options = ContainerOptions::builder(self.image.as_ref())
                 .env(vec!["EULA=TRUE"])
@@ -80,14 +110,17 @@ mod service {
                 .create(&options)
                 .map(move |info| return info)
                 .map_err(|e| eprintln!("Error: {}", e));
-            let info: ContainerCreateInfo = self.runtime.block_on(runner).expect("failed to create container");
+
+            let info: ContainerCreateInfo = self.runtime.block_on(runner).map_err(|e| {
+                MCError::FailedToCreateContainer
+            })?;
+
             if let Some(warnings) = info.warnings {
                 for warning in warnings {
                     warn!("Warning [Container {}]: {}", info.id, warning);
                 }
             }
-
-            Ok(info.id)
+            Ok(Self::get_container(info.id))
         }
 
         pub fn get_container(id: String) -> MCContainer {
@@ -99,7 +132,7 @@ mod service {
 
     }
     pub struct MCContainer {
-        id: String,
+        pub id: String,
     }
 
     pub struct MCContainerService {
@@ -116,9 +149,14 @@ mod service {
             }
         }
 
-        pub fn start(&mut self, container: &MCContainer) -> Result<(), ()> {
+        pub fn status(&mut self, container: &MCContainer) -> Result<(), ()> {
+            Ok(())
+        }
+
+        pub fn start(&mut self, container: &MCContainer) -> Result<(), MCError> {
             info!("Starting container: {}", container.id);
-            let container = Container::new(&self.docker, container.id.clone());
+            let ref container_id = container.id;
+            let container = Container::new(&self.docker, container_id.clone());
             self.runtime.block_on(
                 container.start()
                     .map_err(|e| {
@@ -133,27 +171,40 @@ mod service {
                             },
                             _ => {error!("{}", e)},
                         }
-                    })).expect("couldn't start container");
-            let container_info: ContainerDetails = self.runtime.block_on(container.inspect()).expect("");
+                    }))
+                .map_err(|e|
+                    MCError::FailedToStartContainer(container_id.clone())
+                )?;
+            let container_info: ContainerDetails = self.runtime
+                .block_on(
+                    container.inspect())
+                .map_err(|e| {
+                    MCError::FailedToInspectContainer(container_id.clone())
+                })?;
             if !container_info.state.error.is_empty() {
                 error!("Error: {:?}", container_info.state);
-                return Err(());
+                return Err(MCError::ContainerError(container_id.clone(), container_info.state.error));
             }
             Ok(())
         }
 
-        pub fn stop(&mut self, container: &MCContainer) -> Result<(), ()> {
+        pub fn stop(&mut self, container: &MCContainer) -> Result<(), MCError> {
             info!("Stopping container: {}", container.id);
+            let ref container_id = container.id;
             let container = Container::new(&self.docker, container.id.clone());
             self.runtime.block_on(
                 container
                     .stop(None)
-                    .map_err(|e| error!("{}", e))
-            )
+            ).map_err(|_| {
+                MCError::FailedToStopContainer(container_id.clone())
+            })?;
+            Ok(())
         }
 
-        pub fn run_command(&mut self, container: &MCContainer, command: MCServerCommands) -> Result<(), ()> {
+        pub fn run_command(&mut self, container: &MCContainer, command: MCServerCommands) -> Result<(), MCError> {
             info!("Running command {:?} on container {}", command, container.id);
+            let ref container_id = container.id;
+            let command_for_error = command.clone();
             let container = Container::new(&self.docker, container.id.clone());
             use std::io::prelude::*;
             self.runtime.block_on(
@@ -163,11 +214,13 @@ mod service {
                     mul.write_all(command.to_string().as_bytes());
                     mul.flush();
                 })
-                .map_err(|e| error!("Error: {:?}", e))
-            )
+            ).map_err(|_| {
+                MCError::FailedToRunCommand(container_id.clone(), command_for_error)
+            })?;
+            Ok(())
         }
 
-        pub fn logs(&mut self, container: &MCContainer, options: &MCServerLogOptions) {
+        pub fn logs(&mut self, container: &MCContainer, options: &MCServerLogOptions) -> Result<Vec<String>, ()> {
             info!("Logging container: {}", container.id);
             let container = Container::new(&self.docker, container.id.clone());
             let log_runner = container.logs(&LogsOptions::builder()
@@ -180,13 +233,12 @@ mod service {
                 .map(|res| return res)
                 .map_err(|e| error!("Error: {:?}", e))
             ).expect("");
-
-            for log in logs {
-                info!("{}", log.as_string_lossy());
-            }
+            Ok(logs.into_iter().map(|l| l.as_string_lossy()).collect())
         }
-        pub fn rm(&mut self, container: &MCContainer) -> Result<(), ()> {
+
+        pub fn rm(&mut self, container: &MCContainer) -> Result<(), MCError> {
             info!("Removing container: {}", container.id);
+            let ref container_id = container.id;
             let container = Container::new(&self.docker, container.id.clone());
             let options = RmContainerOptions::builder()
                 .force(true)
@@ -194,13 +246,15 @@ mod service {
             self.runtime.block_on(
                 container
                     .remove(options)
-                    .map_err(|e| error!("{}", e))
-            )
+
+            ).map_err(|e| {
+                MCError::FailedToRMContainer(container_id.clone())
+            })
             // Ok(())
         }
     }
 
-    #[derive(Debug)]
+    #[derive(Debug, Clone)]
     pub enum MCServerCommands {
         OP(String),
     }
@@ -260,22 +314,106 @@ mod service {
     }
 }
 
-fn main() {
-    use crate::service::MCService;
-    env_logger::init();
-    use std::{thread, time};
-    let path = PathBuf::from_str("/Users/kristoncosta/Workspace/PalaceRetreat").expect("couldn't make pathbuf");
-    let server_options = MCServerOptionsBuilder::new("test_name".to_string(), path).build();
-    let mut serv = MCService::new();
-    let id = serv.create(&server_options).expect("couldn't make container");
-    let mut container = MCService::get_container(id);
+mod server {
+    use crate::service::{MCService, MCContainerService, MCServerOptionsBuilder};
+    use rouille::Response;
+    use std::path::PathBuf;
+    use std::str::FromStr;
 
-    let mut container_service = MCContainerService::new();
-    container_service.start(&container).expect("Failed to start");
-    container_service.logs(&container, &Default::default());
-    container_service.run_command(&container, MCServerCommands::OP("Sylent_Buck".to_string()));
-    thread::sleep(time::Duration::from_millis(5000));
-    container_service.logs(&container, &Default::default());
-    container_service.stop(&container).expect("couldn't stop container");
-    container_service.rm(&container).expect("couldn't rm");
+    pub struct Server;
+
+    #[derive(Serialize)]
+    struct BasicResponse {
+        #[serde(skip_serializing_if = "Option::is_none")]
+        success: Option<String>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        error: Option<String>,
+    }
+
+    impl BasicResponse {
+        pub fn success(response: String) -> Self {
+            BasicResponse {
+                success: Some(response),
+                error: None,
+            }
+        }
+        pub fn error(response: String) -> Self {
+            BasicResponse {
+                error: Some(response),
+                success: None,
+            }
+        }
+    }
+
+    impl Server {
+        pub fn new() -> Self {
+            Server
+        }
+
+        pub fn run(&mut self) {
+
+            info!("Listening on port 8081");
+            rouille::start_server("localhost:8081", move |request| {
+                info!("Processing incoming request");
+                let mut mc_service = MCService::new();
+                let mut container_service = MCContainerService::new();
+
+                router!(request,
+                    (POST) (/container) => {
+                        let response = mc_service.create(&MCServerOptionsBuilder::new("SomeName".to_string(),
+                                                                                      PathBuf::from_str("/Users/kristoncosta/workspace/tmp-mc")
+                                                                                          .unwrap()).build());
+                        match response {
+                            Ok(x) => {Response::json(&BasicResponse::success(x.id))},
+                            Err(e) => {
+                                Response::json(&BasicResponse::error(e.to_string()))
+                                    .with_status_code(400)
+                            },
+                        }
+                    },
+                    (POST) (/container/{id: String}/start) => {
+                        let container = MCService::get_container(id);
+                        let response = container_service.start(&container);
+                        match response {
+                            Ok(_) => {Response::json(&BasicResponse::success("success".to_string()))},
+                            Err(e) => {
+                                Response::json(&BasicResponse::error(e.to_string()))
+                                    .with_status_code(400)
+                                },
+                        }
+                    },
+                    (POST) (/container/{id: String}/stop) => {
+                        let container = MCService::get_container(id);
+                        let response = container_service.stop(&container);
+                        match response {
+                            Ok(_) => {Response::json(&BasicResponse::success("success".to_string()))},
+                            Err(e) => {
+                                Response::json(&BasicResponse::error(e.to_string()))
+                                    .with_status_code(400)
+                                },
+                        }
+                    },
+                    (DELETE) (/container/{id: String}) => {
+                        let container = MCService::get_container(id);
+                        let response = container_service.rm(&container);
+                        match response {
+                            Ok(_) => {Response::json(&BasicResponse::success("success".to_string()))},
+                            Err(e) => {
+                                Response::json(&BasicResponse::error(e.to_string()))
+                                    .with_status_code(400)
+                                },
+                        }
+                    },
+                    _ => rouille::Response::empty_404()
+                )
+            });
+        }
+    }
+}
+
+fn main() {
+    env_logger::init();
+    let mut server = Server::new();
+    info!("Starting server");
+    server.run();
 }
